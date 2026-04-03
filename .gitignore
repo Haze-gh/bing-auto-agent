@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.claude/
+.idea/
+.vscode/
+
+# Local config / state
+edge_search_state.json
+auth_state.json
+*.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Playwright
+.playwright/
+
+# Debug scripts
+debug_panel.py
+debug_panel2.py
+test_panel_fix.py
+test_points_check.py
+debug_profile1.py
