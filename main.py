@@ -1,13 +1,11 @@
 """Main entry point for Edge Browser Search Automation."""
+import os
 from playwright.sync_api import sync_playwright
 import config
 from browser.edge_launcher import launch_edge_browser
 from search.bing_navigator import navigate_to_bing, verify_bing_loaded
-from search.search_input import type_search_query, submit_search, verify_search_success
 from state.session_manager import save_state
-from utils.human_behavior import random_delay_before_action
-from rewards.daily_search import perform_daily_searches
-from rewards.activity_executor import execute_all_activities
+from rewards import run_all, run_search_only, run_day_set_only, run_mini_task_only
 
 
 def run_account_automation(p, profile_index: int, profile_name: str, args: dict):
@@ -15,16 +13,14 @@ def run_account_automation(p, profile_index: int, profile_name: str, args: dict)
 
     Args:
         p: Playwright instance
-        profile_index: Index of the profile in the list
+        profile_index: Index of the profile in the list (unused, profile_name is used directly)
         profile_name: Name of the profile (for display)
         args: Command line arguments
 
     Returns:
         Dictionary with automation results
     """
-    import sys
-
-    profile_path = config.get_profile_path_from_config(profile_index)
+    profile_path = os.path.join(config.PROFILE_BASE, profile_name)
     print(f"\n{'='*60}")
     print(f"Starting automation for: {profile_name}")
     print(f"Profile path: {profile_path}")
@@ -77,13 +73,18 @@ def run_account_automation(p, profile_index: int, profile_name: str, args: dict)
         # Determine mode and execute
         if args['activities_only']:
             print("\n=== ACTIVITIES ONLY MODE ===")
-            activity_results = execute_all_activities(page)
+            activity_results = {}
+            day_set_result = run_day_set_only(page)
+            activity_results['day_set'] = day_set_result
+            mini_task_result = run_mini_task_only(page)
+            activity_results['mini_task'] = mini_task_result
             print(f"\nActivity results: {activity_results}")
             results['activities'] = activity_results
 
         elif args['search_only']:
             print("\n=== SEARCH ONLY MODE ===")
-            search_completed = perform_daily_searches(page, count=args['search_count'])
+            search_result = run_search_only(page)
+            search_completed = search_result.get('search', {}).get('searches_completed', 0)
             print(f"\n搜索完成: {search_completed}/{args['search_count']}")
             results['search_completed'] = search_completed
             if search_completed == 0 and args['search_count'] > 0:
@@ -91,32 +92,28 @@ def run_account_automation(p, profile_index: int, profile_name: str, args: dict)
                 print("[Info] Switching to next profile...")
 
         else:
-            # Default: Execute all rewards tasks
+            # Default: Execute all rewards tasks using state machine
             print("\n=== FULL REWARDS AUTOMATION MODE ===")
+            all_results = run_all(page)
+            print(f"\nState machine results: {all_results}")
 
-            # Execute daily searches
-            print("\n--- Daily Searches ---")
-            search_completed = perform_daily_searches(page, count=args['search_count'])
-            print(f"搜索完成: {search_completed}/{args['search_count']}")
-            results['search_completed'] = search_completed
+            # Extract search results
+            if 'search' in all_results:
+                search_data = all_results['search']
+                results['search_completed'] = search_data.get('searches_completed', 0)
 
-            # If daily search already at maximum, skip to next profile
-            if search_completed == 0 and args['search_count'] > 0:
-                print("[Info] Daily search already at maximum for this account.")
-                print("[Info] Skipping activities and switching to next profile...")
-                return results
-
-            # Execute all activity tasks
-            print("\n--- Rewards Activities ---")
-            activity_results = execute_all_activities(page)
-            results['activities'] = activity_results
+            # Extract activity results
+            if 'day_set' in all_results:
+                results['activities']['day_set'] = all_results['day_set']
+            if 'mini_task' in all_results:
+                results['activities']['mini_task'] = all_results['mini_task']
 
             # Summary for this account
             print("\n" + "-" * 40)
             print(f"Account: {profile_name}")
-            print(f"  Searches: {search_completed}/{args['search_count']}")
-            total_completed = sum(r['completed'] for r in activity_results.values())
-            total_attempted = sum(r['attempted'] for r in activity_results.values())
+            print(f"  Searches: {results['search_completed']}/{args['search_count']}")
+            total_completed = sum(r.get('completed', 0) for r in results['activities'].values())
+            total_attempted = sum(r.get('attempted', 0) for r in results['activities'].values())
             print(f"  Activities: {total_completed}/{total_attempted} completed")
 
         # Save state
@@ -138,10 +135,19 @@ def select_profiles(profile_names: list[str]) -> list[int]:
     """
     import sys
     import os
-    import termios
-    import tty
 
-    if not os.isatty(0):
+    # Check if Windows
+    is_windows = os.name == 'nt'
+
+    if not os.isatty(0) or is_windows:
+        # Non-interactive mode or Windows: select all by default
+        return list(range(len(profile_names)))
+
+    try:
+        import termios
+        import tty
+    except ImportError:
+        # termios not available (Windows without WSL)
         return list(range(len(profile_names)))
 
     def read_key():
@@ -221,6 +227,13 @@ def main():
     search_only = "--search-only" in sys.argv
     activities_only = "--activities-only" in sys.argv
 
+    # Parse optional profile name (-p or --profile)
+    new_profile_name = None
+    for arg in sys.argv:
+        if arg.startswith("-p=") or arg.startswith("--profile="):
+            new_profile_name = arg.split("=", 1)[1].strip('"').strip("'")
+            break
+
     # Parse optional search count
     search_count = config.DAILY_SEARCH_GOAL
     for arg in sys.argv:
@@ -234,11 +247,19 @@ def main():
         'login_mode': login_mode,
         'search_only': search_only,
         'activities_only': activities_only,
-        'search_count': search_count
+        'search_count': search_count,
+        'new_profile_name': new_profile_name
     }
 
     # Get list of profiles (auto-detected or manual config)
     all_profile_names = config.get_all_profile_paths()
+
+    # In login mode with -p, use the new profile directly
+    if login_mode and new_profile_name:
+        all_profile_names = [new_profile_name]
+        selected_indices = [0]
+        # Add to profiles.json immediately
+        config.add_profile_to_config(new_profile_name)
 
     print(f"\n{'='*60}")
     print(f"Edge Browser Search Automation")
@@ -247,7 +268,8 @@ def main():
 
     # TUI profile selector (skip in login mode or non-TTY)
     if login_mode:
-        selected_indices = [0] if all_profile_names else []
+        if not new_profile_name:
+            selected_indices = [0] if all_profile_names else []
     else:
         selected_indices = select_profiles(all_profile_names)
 
@@ -277,8 +299,8 @@ def main():
         total_searches += r['search_completed']
 
         if r['activities']:
-            total_completed = sum(res['completed'] for res in r['activities'].values())
-            total_attempted = sum(res['attempted'] for res in r['activities'].values())
+            total_completed = sum(res.get('completed', 0) for res in r['activities'].values())
+            total_attempted = sum(res.get('attempted', 0) for res in r['activities'].values())
             print(f"  Activities: {total_completed}/{total_attempted} completed")
 
     print(f"\nTotal searches across all accounts: {total_searches}")

@@ -1,0 +1,20 @@
+{
+    "auto_detect_profiles": false,
+    "profile_base": "~/.config/microsoft-edge",
+    "full_profiles": [
+        "Default",
+        "Profile 1",
+        "Profile 2",
+        "Profile 3",
+        "Profile 4",
+        "Profile 5",
+        "Profile 6",
+        "Profile 7",
+        "Profile 8"
+    ],
+    "profiles": [
+        "Profile 6",
+        "Profile 7",
+        "Profile 8"
+    ]
+}
