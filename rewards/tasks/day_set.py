@@ -78,6 +78,52 @@ def _close_extra_tabs(page: Page) -> int:
     return closed_count
 
 
+def _close_overlay(page: Page) -> bool:
+    """Close any blocking overlay/modal that may appear after activities.
+
+    Args:
+        page: Playwright page instance
+
+    Returns:
+        True if an overlay was closed, False otherwise
+    """
+    try:
+        # Overlay typically has fixed positioning, high z-index, covers the screen
+        overlay_selectors = [
+            "div.fixed.inset-0.z-40",
+            "[class*='fixed'][class*='inset-0'][class*='z-40']",
+            "[class*='Smoke']",
+            "[data-rac'][class*='fixed']",
+        ]
+        for sel in overlay_selectors:
+            try:
+                overlay = page.locator(sel).first
+                if overlay.is_visible(timeout=2000):
+                    # Try clicking the close button or pressing Escape
+                    close_btns = [
+                        overlay.locator("button").last,
+                        overlay.locator("[aria-label*='close' i]").first,
+                        overlay.locator("button[aria-label*='关']").first,
+                    ]
+                    for btn in close_btns:
+                        try:
+                            if btn.is_visible(timeout=1000):
+                                btn.click()
+                                page.wait_for_timeout(500)
+                                return True
+                        except Exception:
+                            continue
+                    # Fallback: press Escape
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def discover_activities(page: Page) -> list:
     """Find incomplete daily set activities.
 
@@ -87,22 +133,45 @@ def discover_activities(page: Page) -> list:
     Returns:
         List of activity link elements
     """
-    activity_links = page.locator("#dailyset a[href*='bing.com/search']").all()
+    # Close any overlay that might block interactions
+    _close_overlay(page)
+
+    # Expand the DisclosurePanel to access hidden content
+    expand_selectors = [
+        "#dailyset button[aria-label*='每日活动']",
+        "#dailyset button[aria-expanded='false']",
+    ]
+    for sel in expand_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=3000):
+                page.evaluate(f"document.querySelector('{sel}').click()")
+                page.wait_for_timeout(2000)
+                break
+        except Exception:
+            continue
+
+    # Find activity links inside #dailyset
+    activity_links = page.locator("#dailyset a").all()
 
     incomplete = []
     for link in activity_links:
         try:
-            if not link.is_visible():
+            href = link.get_attribute("href") or ""
+            link_text = link.evaluate("el => el.textContent")
+
+            # Skip non-Bing/rewards links
+            if "rewards.bing.com" not in href and "bing.com" not in href:
                 continue
 
-            link_text = link.inner_text()
+            # Skip redeem links
+            if "redeem" in href:
+                continue
 
             if "已完成" in link_text:
-                print(f"[Daily Set] Skipping completed: {link_text[:30]}...")
                 continue
 
             if "+" not in link_text:
-                print(f"[Daily Set] Skipping (no points): {link_text[:30]}...")
                 continue
 
             incomplete.append(link)
@@ -111,6 +180,47 @@ def discover_activities(page: Page) -> list:
             continue
 
     return incomplete
+
+
+def _try_complete_activity_on_page(page: Page) -> bool:
+    """Try to complete an activity by interacting with common elements.
+
+    Args:
+        page: Playwright page instance
+
+    Returns:
+        True if some interaction happened, False otherwise
+    """
+    try:
+        page.wait_for_timeout(2000)
+
+        interactive_selectors = [
+            "[role='radio']",
+            "[role='checkbox']",
+            "[role='option']",
+            "button",
+            ".quiz-option",
+            ".poll-option",
+            "[class*='option']",
+            "[class*='choice']",
+            "[class*='quiz']",
+            "[class*='poll']",
+        ]
+
+        for selector in interactive_selectors:
+            try:
+                elements = page.locator(selector).all()
+                for elem in elements:
+                    if elem.is_visible() and elem.is_enabled():
+                        elem.click()
+                        page.wait_for_timeout(500)
+                        return True
+            except Exception:
+                continue
+
+        return False
+    except Exception:
+        return False
 
 
 def execute_activity(page: Page, link) -> bool:
@@ -124,24 +234,65 @@ def execute_activity(page: Page, link) -> bool:
         True if completed, False otherwise
     """
     try:
-        link_text = link.inner_text()
         href = link.get_attribute("href") or ""
-        print(f"[Daily Set] Clicking: {link_text[:50]}...")
+        link_text = link.evaluate("el => el.textContent")
+        print(f"[Daily Set] Executing: {link_text[:50]}...")
         print(f"   URL: {href[:80]}")
 
-        link.click()
+        if not href:
+            print("[Daily Set] ERROR: no href found")
+            return False
+
+        # Count tabs before click
+        pages_before = len(page.context.pages)
+
+        # Use JavaScript click via href selector (more reliable for this element)
+        # Use encodeURIComponent to avoid quote escaping issues
+        js_click = (
+            f"document.querySelector('#dailyset a[href=\"{href}\"]').click()"
+        )
+        try:
+            page.evaluate(js_click)
+        except Exception:
+            # Fallback: use CSS.escape for problematic characters
+            js_click = (
+                f"document.querySelector('#dailyset a[href=\"' + CSS.escape('{href}') + '\"]').click()"
+            )
+            try:
+                page.evaluate(js_click)
+            except Exception as e:
+                print(f"[Daily Set] JS click failed: {e}")
+                return False
+
+        # Wait for new tab to open
         page.wait_for_timeout(3000)
+
+        # Switch to new tab if opened
+        context = page.context
+        if len(context.pages) > pages_before:
+            for tab in context.pages:
+                if tab != page:
+                    tab.bring_to_front()
+                    page = tab
+                    print(f"[Daily Set] Switched to new tab: {tab.url[:80]}")
+                    break
+        else:
+            print("[Daily Set] WARNING: No new tab opened, using current page")
 
         page.wait_for_timeout(random.randint(
             config.ACTIVITY_DELAY_MIN, config.ACTIVITY_DELAY_MAX
         ))
 
+        _try_complete_activity_on_page(page)
         _close_extra_tabs(page)
 
+        print("[Daily Set] Activity executed successfully")
         return True
 
     except Exception as e:
+        import traceback
         print(f"[Daily Set] Activity error: {e}")
+        traceback.print_exc()
         return False
 
 
@@ -196,10 +347,32 @@ def run(page: Page) -> dict:
             activity_links = discover_activities(page)
             print(f"[Daily Set] Processed, {len(activity_links)} activities remaining")
 
+        # Check remaining incomplete activities - close overlay and expand panel
+        _close_overlay(page)
+        try:
+            expand_btn = page.locator("#dailyset button[aria-expanded='false']").first
+            if expand_btn.is_visible(timeout=3000):
+                page.evaluate(
+                    "document.querySelector('#dailyset button[aria-expanded=\"false\"]').click()"
+                )
+                page.wait_for_selector(
+                    "#dailyset button[aria-expanded='true']",
+                    timeout=5000
+                )
+                page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
         incomplete_count = 0
-        for link in page.locator("#dailyset a[href*='bing.com/search']").all():
+        for link in page.locator("#dailyset a").all():
             try:
-                if link.is_visible() and "+" in link.inner_text() and "已完成" not in link.inner_text():
+                href = link.get_attribute("href") or ""
+                if "rewards.bing.com" not in href and "bing.com" not in href:
+                    continue
+                if "redeem" in href:
+                    continue
+                link_text = link.evaluate("el => el.textContent")
+                if "+" in link_text and "已完成" not in link_text:
                     incomplete_count += 1
             except:
                 pass
